@@ -34,6 +34,7 @@ class Bench(Base):
         self.config_directory = os.path.join(self.directory, "config")
         self.logs_directory = os.path.join(self.directory, "logs")
         self.apps_file = os.path.join(self.directory, "sites", "apps.txt")
+        self.deepvision_directory = os.path.join(self.server.benches_directory, ".deepvision")
         self.bench_config_file = os.path.join(self.directory, "config.json")
         self.config_file = os.path.join(
             self.directory, "sites", "common_site_config.json"
@@ -719,7 +720,9 @@ class Bench(Base):
             ssh_ip = self.bench_config.get("private_ip", "127.0.0.1")
 
             bench_directory = "/home/frappe/frappe-bench"
+            deep_dir = "/home/frappe/"
             mounts = self.prepare_mounts_on_host(bench_directory)
+
 
             command = (
                 "docker run -d --init -u frappe "
@@ -731,6 +734,7 @@ class Bench(Base):
                 f"-v {self.sites_directory}:{bench_directory}/sites "
                 f"-v {self.logs_directory}:{bench_directory}/logs "
                 f"-v {self.config_directory}:{bench_directory}/config "
+                f"-v {self.deepvision_directory}:{deep_dir}/.deepvision "
                 f"{ mounts } "
                 f"--name {self.name} {self.bench_config['docker_image']}"
             )
