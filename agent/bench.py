@@ -10,9 +10,7 @@ from filelock import FileLock
 from random import choices
 from glob import glob
 from datetime import datetime, timedelta
-from glob import glob
 from pathlib import Path
-from random import choices
 from typing import Dict
 
 import requests
@@ -138,10 +136,17 @@ class Bench(Base):
                 traceback.print_exc()
         return analytics
 
-    def execute(self, command, input=None):
-        return super().execute(command, directory=self.directory, input=input)
+    def execute(self, command, input=None, non_zero_throw=True):
+        return super().execute(
+            command,
+            directory=self.directory,
+            input=input,
+            non_zero_throw=non_zero_throw,
+        )
 
-    def docker_execute(self, command, input=None, subdir=None):
+    def docker_execute(
+        self, command, input=None, subdir=None, non_zero_throw=True
+    ):
         interactive = "-i" if input else ""
         workdir = "/home/frappe/frappe-bench"
         if subdir:
@@ -162,7 +167,9 @@ class Bench(Base):
                 f"docker exec -w {workdir} "
                 f"{interactive} {service}.1.{task} {command}"
             )
-        return self.execute(command, input=input)
+        return self.execute(
+            command, input=input, non_zero_throw=non_zero_throw
+        )
 
     @step("New Site")
     def bench_new_site(self, name, mariadb_root_password, admin_password):
@@ -442,7 +449,8 @@ class Bench(Base):
 
     @step("Bench Setup NGINX")
     def setup_nginx(self):
-        self.generate_nginx_config()
+        with FileLock(os.path.join(self.directory, "nginx.config.lock")):
+            self.generate_nginx_config()
         self.server._reload_nginx()
 
     @step("Bench Setup NGINX Target")
@@ -876,12 +884,9 @@ class Bench(Base):
 
         if build_assets:
             self.rebuild()
-        else:
-            self.run_dummy_step("Rebuild Bench Assets")
 
         self.restart()
-        
-        
+
     def prepare_app_patch(self, app: str, patch: str, filename: str) -> str:
         """
         Function returns path inside the container, the sites is
@@ -893,7 +898,9 @@ class Bench(Base):
         patch_dir.mkdir(parents=True, exist_ok=True)
 
         bench_container_dir = "/home/frappe/frappe-bench"
-        patch_container_dir = os.path.join(bench_container_dir, *relative, filename)
+        patch_container_dir = os.path.join(
+            bench_container_dir, *relative, filename
+        )
 
         patch_path = patch_dir / filename
         if patch_path.is_file():
@@ -901,9 +908,8 @@ class Bench(Base):
 
         with patch_path.open("w") as f:
             f.write(patch)
-        
+
         return patch_container_dir
-    
 
     @step("Git Apply")
     def git_apply(self, app: str, revert: bool, patch_container_path: str):
@@ -915,13 +921,13 @@ class Bench(Base):
         app_path = os.path.join("apps", app)
         self.docker_execute(command, subdir=app_path)
 
-    def run_dummy_step(self, name: str):
-        """
-        To be used for logging purposes when
-        a step is optional and so not being 
-        actually run
-        """
-        step(name)(self.dummy)()
-        
-    def dummy(self):
-        pass
+    @job("Call Bench Supervisorctl")
+    def call_supervisorctl(self, command: str, programs: "list[str]"):
+        self.run_supervisorctl_command(command, programs)
+
+    @step("Run Supervisorctl Command")
+    def run_supervisorctl_command(self, command: str, programs: "list[str]"):
+        target = "all"
+        if len(programs) > 0:
+            target = " ".join(programs)
+        self.docker_execute(f"supervisorctl {command} {target}")

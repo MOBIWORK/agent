@@ -3,25 +3,44 @@ import logging
 import os
 import sys
 import traceback
-import uuid
 from base64 import b64decode
 from functools import wraps
+from typing import TYPE_CHECKING
 
 from flask import Flask, jsonify, request
 from passlib.hash import pbkdf2_sha256 as pbkdf2
 from playhouse.shortcuts import model_to_dict
 
-from agent.builder import get_image_build_context_directory, ImageBuilder
-from agent.proxy import Proxy
-from agent.ssh import SSHProxy
-from agent.job import JobModel, connection
-from agent.server import Server
-from agent.monitor import Monitor
+from agent.builder import ImageBuilder, get_image_build_context_directory
 from agent.database import DatabaseServer
 from agent.exceptions import BenchNotExistsException, SiteNotExistsException
+from agent.job import JobModel, connection
 from agent.minio import Minio
+from agent.monitor import Monitor
+from agent.proxy import Proxy
 from agent.proxysql import ProxySQL
 from agent.security import Security
+from agent.server import Server
+from agent.ssh import SSHProxy
+
+if TYPE_CHECKING:
+    from datetime import datetime, timedelta
+    from typing import Optional, TypedDict
+
+    ExecuteReturn = TypedDict(
+        "ExecuteReturn",
+        {
+            "command": str,
+            "status": str,
+            "start": datetime,
+            "end": datetime,
+            "duration": timedelta,
+            "output": str,
+            "directory": Optional[str],
+            "traceback": Optional[str],
+            "returncode": Optional[int],
+        },
+    )
 
 application = Flask(__name__)
 
@@ -134,20 +153,32 @@ def ping():
     return {"message": "pong"}
 
 
-@application.route("/builder/upload", methods=["POST"])
-def upload_build_context_for_image_builder():
-    if "build_context_file" not in request.files:
-        return {"message": "No file part"}, 400
+@application.route("/builder/upload/<string:dc_name>", methods=["POST"])
+def upload_build_context_for_image_builder(dc_name: str):
+    filename = f"{dc_name}.tar.gz"
+    filepath = os.path.join(get_image_build_context_directory(), filename)
+    if os.path.exists(filepath):
+        os.unlink(filepath)
+
     build_context_file = request.files["build_context_file"]
-    filename = f"{uuid.uuid4()}.tar.gz"
-    build_context_file.save(os.path.join(get_image_build_context_directory(), filename))
+    build_context_file.save(filepath)
     return {"filename": filename}
+
 
 @application.route("/builder/build", methods=["POST"])
 def build_image():
     data = request.json
-    job = ImageBuilder(**data).build_and_push_image()
+    image_builder = ImageBuilder(
+        filename=data.get("filename"),
+        image_repository=data.get("image_repository"),
+        image_tag=data.get("image_tag"),
+        no_cache=data.get("no_cache"),
+        no_push=data.get("no_push"),
+        registry=data.get("registry"),
+    )
+    job = image_builder.run_remote_builder()
     return {"job": job}
+
 
 @application.route("/server")
 def get_server():
@@ -883,6 +914,12 @@ def get_database_processes():
     return jsonify(DatabaseServer().processes(**data))
 
 
+@application.route("/database/locks", methods=["POST"])
+def get_database_locks():
+    data = request.json
+    return jsonify(DatabaseServer().locks(**data))
+
+
 @application.route("/database/processes/kill", methods=["POST"])
 def kill_database_processes():
     data = request.json
@@ -1159,7 +1196,9 @@ def archive_code_server(bench):
     return {"job": job}
 
 
-@application.route("/benches/<string:bench>/patch/<string:app>", methods=["POST"])
+@application.route(
+    "/benches/<string:bench>/patch/<string:app>", methods=["POST"]
+)
 @validate_bench
 def patch_app(bench, app):
     data = request.json
@@ -1186,6 +1225,35 @@ def all_exception_handler(error):
     }, 500
 
 
+@application.route("/benches/<string:bench>/docker_execute", methods=["POST"])
+@validate_bench
+def docker_execute(bench: str):
+    data = request.json
+    _bench = Server().benches[bench]
+    result: "ExecuteReturn" = _bench.docker_execute(
+        command=data.get("command"),
+        subdir=data.get("subdir"),
+        non_zero_throw=False,
+    )
+
+    result["start"] = result["start"].isoformat()
+    result["end"] = result["end"].isoformat()
+    result["duration"] = result["duration"].total_seconds()
+    return result
+
+
+@application.route("/benches/<string:bench>/supervisorctl", methods=["POST"])
+@validate_bench
+def call_bench_supervisorctl(bench: str):
+    data = request.json
+    _bench = Server().benches[bench]
+    job = _bench.call_supervisorctl(
+        data["command"],
+        data["programs"],
+    )
+    return {"job": job}
+
+
 @application.errorhandler(BenchNotExistsException)
 def bench_not_found(e):
     return {
@@ -1202,3 +1270,19 @@ def site_not_found(e):
             traceback.format_exception(*sys.exc_info())
         ).splitlines()
     }, 404
+
+
+@application.route("/docker_cache_utils/<string:method>", methods=["POST"])
+def docker_cache_utils(method: str):
+    from agent.docker_cache_utils import (
+        run_command_in_docker_cache,
+        get_cached_apps,
+    )
+
+    if method == "run_command_in_docker_cache":
+        return run_command_in_docker_cache(**request.json)
+
+    if method == "get_cached_apps":
+        return get_cached_apps()
+
+    return None
