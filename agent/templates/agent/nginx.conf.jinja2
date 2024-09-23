@@ -187,6 +187,7 @@ server {
 		auth_basic "Monitoring";
 		auth_basic_user_file /home/frappe/agent/nginx/grafana.htpasswd;
 		proxy_pass http://127.0.0.1:9090/prometheus;
+		proxy_read_timeout 600;
 	}
 
 	location /alertmanager {
@@ -268,7 +269,7 @@ server {
 	{% elif analytics %}
 
 	location / {
-		proxy_set_header X-Forwarded-For $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 		proxy_pass http://127.0.0.1:8000/;
 	}
 

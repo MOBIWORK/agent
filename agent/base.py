@@ -1,24 +1,28 @@
+from __future__ import annotations
+
 import json
 import os
 import subprocess
 import traceback
 from datetime import datetime
 from functools import partial
+from typing import TYPE_CHECKING
 
 import redis
 
 from agent.job import connection
-from typing import TYPE_CHECKING
+from agent.utils import get_execution_result
 
 if TYPE_CHECKING:
-    from typing import Optional, Any
+    from typing import Any
+
     from agent.job import Job, Step
 
 
 class Base:
     if TYPE_CHECKING:
-        job_record: "Optional[Job]"
-        step_record: "Optional[Step]"
+        job_record: Job | None
+        step_record: Step | None
 
     def __init__(self):
         self.directory = None
@@ -41,13 +45,9 @@ class Base:
         directory = directory or self.directory
         start = datetime.now()
         self.skip_output_log = skip_output_log
-        self.data = {
-            "command": command,
-            "directory": directory,
-            "start": start,
-            "status": "Running",
-        }
+        self.data = get_execution_result(command, directory, start)
         self.log()
+        output = ""
         try:
             output, returncode = self.run_subprocess(
                 command,
@@ -57,7 +57,7 @@ class Base:
                 non_zero_throw,
             )
         except subprocess.CalledProcessError as e:
-            output = e.output
+            output = str(e.output or "")
             returncode = e.returncode
             self.data.update(
                 {
@@ -65,7 +65,7 @@ class Base:
                     "traceback": "".join(traceback.format_exc()),
                 }
             )
-            raise AgentException(self.data)
+            raise AgentException(self.data) from e
         else:
             self.data.update({"status": "Success"})
         finally:
@@ -81,9 +81,7 @@ class Base:
             self.log()
         return self.data
 
-    def run_subprocess(
-        self, command, directory, input, executable, non_zero_throw=True
-    ):
+    def run_subprocess(self, command, directory, input, executable, non_zero_throw=True):
         # Start a child process and start reading output immediately
         with subprocess.Popen(
             command,
@@ -98,51 +96,48 @@ class Base:
                 process._stdin_write(input.encode())
 
             output = self.parse_output(process)
-            returncode = process.poll()
+            returncode = process.poll() or 0
             # This is equivalent of check=True
             # Raise an exception if the process returns a non-zero return code
             if non_zero_throw and returncode:
-                raise subprocess.CalledProcessError(
-                    returncode, command, output=output
-                )
+                raise subprocess.CalledProcessError(returncode, command, output=output)
         return output, returncode
 
-    def parse_output(self, process):
+    def parse_output(self, process) -> str:
         if not process.stdout:
             return ""
 
-        line = ""
+        line = b""
         lines = []
         # This is equivalent of remove_crs
         # Make sure output matches what'll be shown in the terminal
         # This won't work for top, htop etc, but good enough to handle progress bars
-        for char in iter(partial(process.stdout.read, 1), ""):
-            char = char.decode(errors="replace")
-            if char == "" and process.poll() is not None:
+        for char in iter(partial(process.stdout.read, 1), b""):
+            if char == b"" and process.poll() is not None:
                 break
-            elif char == "\r":
+            if char == b"\r":
                 # Publish output and then wipe current line.
                 # Include the overwritten line in the output
-                self.publish_lines(lines + [line])
-                line = ""
-            elif char == "\n":
-                lines.append(line)
-                line = ""
+                self.publish_lines([*lines, line.decode(errors="replace")])
+                line = b""
+            elif char == b"\n":
+                lines.append(line.decode(errors="replace"))
+                line = b""
                 self.publish_lines(lines)
             else:
                 line += char
 
         if line:
-            lines.append(line)
+            lines.append(line.decode(errors="replace"))
         self.publish_lines(lines)
         return "\n".join(lines)
 
-    def publish_lines(self, lines: "list[str]"):
+    def publish_lines(self, lines: list[str]):
         output = "\n".join(lines)
         self.data.update({"output": output})
         self.update_redis()
 
-    def publish_data(self, data: "Any"):
+    def publish_data(self, data: Any):
         if not isinstance(data, str):
             data = json.dumps(data, default=str)
 
@@ -223,9 +218,7 @@ class Base:
                         "name": x,
                         "size": stats.st_size / 1000,
                         "created": str(datetime.fromtimestamp(stats.st_ctime)),
-                        "modified": str(
-                            datetime.fromtimestamp(stats.st_mtime)
-                        ),
+                        "modified": str(datetime.fromtimestamp(stats.st_mtime)),
                     }
                 )
 
@@ -238,7 +231,8 @@ class Base:
         if name not in {x["name"] for x in self.logs}:
             return ""
         log_file = os.path.join(self.logs_directory, name)
-        return open(log_file).read()
+        with open(log_file) as lf:
+            return lf.read()
 
 
 class AgentException(Exception):

@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 import json
 import os
-import sys
 import shutil
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 import requests
 
 from agent.proxy import Proxy
 from agent.server import Server
+from agent.utils import get_timestamp
+
+if TYPE_CHECKING:
+    from IPython.terminal.embed import InteractiveShellEmbed
 
 
 @click.group()
@@ -51,7 +59,8 @@ def ping_server(password: str):
 @click.option("--user", default="frappe")
 @click.option("--workers", required=True, type=int)
 @click.option("--proxy-ip", required=False, type=str)
-def config(name, user, workers, proxy_ip=None):
+@click.option("--sentry-dsn", required=False, type=str)
+def config(name, user, workers, proxy_ip=None, sentry_dsn=None):
     config = {
         "benches_directory": f"/home/{user}/benches",
         "name": name,
@@ -65,14 +74,23 @@ def config(name, user, workers, proxy_ip=None):
     }
     if proxy_ip:
         config["proxy_ip"] = proxy_ip
+    if sentry_dsn:
+        config["sentry_dsn"] = sentry_dsn
 
-    json.dump(config, open("config.json", "w"), sort_keys=True, indent=4)
+    with open("config.json", "w") as f:
+        json.dump(config, f, sort_keys=True, indent=4)
 
 
 @setup.command()
 @click.option("--password", prompt=True, hide_input=True)
 def authentication(password):
     Server().setup_authentication(password)
+
+
+@setup.command()
+@click.option("--sentry-dsn", required=True)
+def sentry(sentry_dsn):
+    Server().setup_sentry(sentry_dsn)
 
 
 @setup.command()
@@ -111,7 +129,7 @@ def standalone(domain=None):
 
 @setup.command()
 def database():
-    from agent.job import JobModel, StepModel, PatchLogModel
+    from agent.job import JobModel, PatchLogModel, StepModel
     from agent.job import agent_database as database
 
     database.create_tables([JobModel, StepModel, PatchLogModel])
@@ -129,10 +147,7 @@ def site_analytics():
     stderr = os.path.join(logs_directory, "analytics.error.log")
 
     cron = CronTab(user=True)
-    command = (
-        f"cd {agent_directory} && {sys.executable} {script}"
-        f" 1>> {stdout} 2>> {stderr}"
-    )
+    command = f"cd {agent_directory} && {sys.executable} {script}" f" 1>> {stdout} 2>> {stderr}"
 
     if command in str(cron):
         cron.remove_all(command=command)
@@ -155,10 +170,7 @@ def usage():
     stderr = os.path.join(logs_directory, "usage.error.log")
 
     cron = CronTab(user=True)
-    command = (
-        f"cd {agent_directory} && {sys.executable} {script}"
-        f" 1>> {stdout} 2>> {stderr}"
-    )
+    command = f"cd {agent_directory} && {sys.executable} {script}" f" 1>> {stdout} 2>> {stderr}"
 
     if command not in str(cron):
         job = cron.new(command=command)
@@ -179,9 +191,7 @@ def monitor(url, token):
     from agent.monitor import Monitor
 
     server = Monitor()
-    server.update_config(
-        {"monitor": True, "press_url": url, "press_token": token}
-    )
+    server.update_config({"monitor": True, "press_url": url, "press_token": token})
     server.discover_targets()
 
 
@@ -256,8 +266,7 @@ def bench():
 def start(bench):
     if bench:
         return Server().benches[bench].start()
-    else:
-        return Server().start_all_benches()
+    return Server().start_all_benches()
 
 
 @bench.command()
@@ -265,5 +274,91 @@ def start(bench):
 def stop(bench):
     if bench:
         return Server().benches[bench].stop()
+    return Server().stop_all_benches()
+
+
+@cli.command(help="Run iPython console.")
+@click.option(
+    "--config-path",
+    required=False,
+    type=str,
+    help="Path to agent config.json.",
+)
+def console(config_path):
+    from atexit import register
+
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    terminal = InteractiveShellEmbed.instance()
+
+    config_dir = get_config_dir(config_path)
+    if config_dir:
+        try:
+            locals()["server"] = Server(config_dir)
+            print(f"In namespace:\nserver = agent.server.Server('{config_dir}')")
+        except Exception:
+            print(f"Could not initialize agent.server.Server('{config_dir}')")
+
+    elif config_path:
+        print(f"Could not find config.json at '{config_path}'")
     else:
-        return Server().stop_all_benches()
+        print("Could not find config.json use --config-path to specify")
+
+    register(store_ipython_logs, terminal, config_dir)
+
+    # ref: https://stackoverflow.com/a/74681224
+    try:
+        from IPython.core import ultratb
+
+        ultratb.VerboseTB._tb_highlight = "bg:ansibrightblack"
+    except Exception:
+        pass
+
+    terminal.colors = "neutral"
+    terminal.display_banner = False
+    terminal()
+
+
+def get_config_dir(config_path: str | None = None) -> str | None:
+    cwd = os.getcwd()
+    if config_path is None:
+        config_path = cwd
+
+    config_dir = Path(config_path)
+
+    if config_dir.suffix == "json" and config_dir.exists():
+        return config_dir.parent.as_posix()
+
+    if config_dir.suffix != "":
+        config_dir = config_dir.parent
+
+    potential = [
+        Path("/home/frappe/agent/config.json"),
+        config_dir / "config.json",
+        config_dir / ".." / "config.json",
+    ]
+
+    for p in potential:
+        if not p.exists():
+            continue
+        try:
+            return p.parent.relative_to(cwd).as_posix()
+        except Exception:
+            return p.parent.as_posix()
+    return None
+
+
+def store_ipython_logs(terminal: InteractiveShellEmbed, config_dir: str | None):
+    if not config_dir:
+        config_dir = os.getcwd()
+
+    log_path = Path(config_dir) / "logs" / "agent_console.log"
+    log_path.parent.mkdir(exist_ok=True)
+
+    with log_path.open("a") as file:
+        timestamp = get_timestamp()
+
+        file.write(f"# SESSION BEGIN {timestamp}\n")
+        for line in terminal.history_manager.get_range():
+            file.write(f"{line[2]}\n")
+        file.write(f"# SESSION END {timestamp}\n\n")

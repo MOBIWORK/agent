@@ -1,9 +1,15 @@
+from __future__ import annotations
+
+import json
 import os
-from agent.server import Server
-from pathlib import Path
-from datetime import datetime, timezone
 import re
+from datetime import datetime, timezone
+from pathlib import Path
+
 from peewee import MySQLDatabase
+
+from agent.job import job, step
+from agent.server import Server
 
 
 class DatabaseServer(Server):
@@ -14,6 +20,9 @@ class DatabaseServer(Server):
 
         self.mariadb_directory = "/var/lib/mysql"
         self.pt_stalk_directory = "/var/lib/pt-stalk"
+
+        self.job = None
+        self.step = None
 
     def search_binary_log(
         self,
@@ -30,31 +39,29 @@ class DatabaseServer(Server):
             f"mysqlbinlog --short-form --database {database} "
             f"--start-datetime '{start_datetime}' "
             f"--stop-datetime '{stop_datetime}' "
-            f" {log} | grep -Piv '{LINES_TO_SKIP}' | head -n {max_lines}"
+            f" {log} | grep -Piv '{LINES_TO_SKIP}'"
         )
 
         DELIMITER = "/*!*/;"
 
         events = []
         timestamp = 0
-        for line in self.execute(command, skip_output_log=True)[
-            "output"
-        ].split(DELIMITER):
+        for line in self.execute(command, skip_output_log=True)["output"].split(DELIMITER):
             line = line.strip()
             if line.startswith("SET TIMESTAMP"):
                 timestamp = int(line.split("=")[-1].split(".")[0])
             else:
                 if any(line.startswith(skip) for skip in ["SET", "/*!"]):
                     continue
-                elif line and timestamp and re.search(search_pattern, line):
+                if line and timestamp and re.search(search_pattern, line):
                     events.append(
                         {
                             "query": line,
-                            "timestamp": str(
-                                datetime.utcfromtimestamp(timestamp)
-                            ),
+                            "timestamp": str(datetime.utcfromtimestamp(timestamp)),
                         }
                     )
+                    if len(events) > max_lines:
+                        break
         return events
 
     @property
@@ -68,9 +75,7 @@ class DatabaseServer(Server):
                     {
                         "name": file.name,
                         "size": file.stat().st_size,
-                        "modified": str(
-                            datetime.utcfromtimestamp(unix_timestamp)
-                        ),
+                        "modified": str(datetime.utcfromtimestamp(unix_timestamp)),
                     }
                 )
         return sorted(files, key=lambda x: x["name"])
@@ -100,20 +105,21 @@ class DatabaseServer(Server):
                 host=private_ip,
                 port=3306,
             )
-            return self.sql(mariadb, """
+            return self.sql(
+                mariadb,
+                """
                     SELECT l.*, t.*
                     FROM information_schema.INNODB_LOCKS l
                     JOIN information_schema.INNODB_TRX t ON l.lock_trx_id = t.trx_id
-            """)
+            """,
+            )
         except Exception:
             import traceback
 
             traceback.print_exc()
         return []
 
-    def kill_processes(
-        self, private_ip, mariadb_root_password, kill_threshold
-    ):
+    def kill_processes(self, private_ip, mariadb_root_password, kill_threshold):
         processes = self.processes(private_ip, mariadb_root_password)
         try:
             mariadb = MySQLDatabase(
@@ -170,9 +176,13 @@ class DatabaseServer(Server):
         columns = [d[0] for d in cursor.description]
         return list(map(lambda x: dict(zip(columns, x)), rows))
 
-    def fetch_column_stats(
-        self, schema, table, private_ip, mariadb_root_password
-    ):
+    @job("Column Statistics")
+    def fetch_column_stats(self, schema, table, private_ip, mariadb_root_password, doc_name):
+        self._fetch_column_stats(schema, table, private_ip, mariadb_root_password)
+        return {"doc_name": doc_name}
+
+    @step("Fetch Column Statistics")
+    def _fetch_column_stats(self, schema, table, private_ip, mariadb_root_password):
         """Get various stats about columns in a table.
 
         Refer:
@@ -196,7 +206,9 @@ class DatabaseServer(Server):
             results = self.sql(
                 mariadb,
                 """
-                SELECT column_name, nulls_ratio, avg_length, avg_frequency, decode_histogram(hist_type,histogram) as histogram
+                SELECT
+                    column_name, nulls_ratio, avg_length, avg_frequency,
+                    decode_histogram(hist_type,histogram) as histogram
                 from mysql.column_stats
                 WHERE db_name = %s
                     and table_name = %s """,
@@ -209,7 +221,7 @@ class DatabaseServer(Server):
         except Exception as e:
             print(e)
 
-        return results
+        return {"output": json.dumps(results)}
 
     def explain_query(self, schema, query, private_ip, mariadb_root_password):
         mariadb = MySQLDatabase(
@@ -231,14 +243,18 @@ class DatabaseServer(Server):
     def get_stalk(self, name):
         diagnostics = []
         for file in Path(self.pt_stalk_directory).iterdir():
+            if os.path.getsize(os.path.join(self.pt_stalk_directory, file.name)) > 16 * (1024**2):
+                # Skip files larger than 16 MB
+                continue
             if re.match(name, file.name):
+                pt_stalk_path = (os.path.join(self.pt_stalk_directory, file.name),)
+                with open(pt_stalk_path, errors="replace") as f:
+                    output = f.read()
+
                 diagnostics.append(
                     {
                         "type": file.name.replace(name, "").strip("-"),
-                        "output": open(
-                            os.path.join(self.pt_stalk_directory, file.name),
-                            errors="replace",
-                        ).read(),
+                        "output": output,
                     }
                 )
         return sorted(diagnostics, key=lambda x: x["type"])
@@ -253,9 +269,7 @@ class DatabaseServer(Server):
                 stalks.append(
                     {
                         "name": stalk,
-                        "timestamp": datetime.strptime(
-                            stalk, "%Y_%m_%d_%H_%M_%S"
-                        )
+                        "timestamp": datetime.strptime(stalk, "%Y_%m_%d_%H_%M_%S")
                         .replace(tzinfo=timezone.utc)
                         .isoformat(),
                     }
